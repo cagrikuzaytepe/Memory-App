@@ -119,7 +119,7 @@ async def generate_artistic_image_endpoint(request: ImageRequest, current_user: 
         response_data = response.json()
         image_base64 = response_data["artifacts"][0]["base64"]
 
-        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        crud.update_user_credits(db, user_id=current_user.id, amount=-1)
         return {"image_base64": image_base64}
 
     except requests.exceptions.Timeout:
@@ -144,7 +144,7 @@ async def generate_story_endpoint(request: StoryRequest, current_user: schemas.U
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content([prompt, image_pil])
 
-        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        crud.update_user_credits(db, user_id=current_user.id, amount=-1)
         return {"story": response.text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred while generating the story: {e}")
@@ -180,7 +180,7 @@ async def generate_soundscape_endpoint(request: SoundRequest, current_user: sche
         audio_fp.seek(0)
         audio_bytes_base64 = base64.b64encode(audio_fp.read()).decode("utf-8")
 
-        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        crud.update_user_credits(db, user_id=current_user.id, amount=-1)
         return {"audio_base64": audio_bytes_base64}
 
     except Exception as e:
