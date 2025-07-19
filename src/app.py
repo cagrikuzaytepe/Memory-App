@@ -174,7 +174,7 @@ async def generate_soundscape_endpoint(request: SoundRequest, current_user: sche
         poetic_text = poetic_text_response.text.strip()
 
         # Adım 2: gTTS ile metni sese dönüştür
-        tts = gTTS(text=poetic_text, lang='tr', slow=False)
+        tts = gTTS(text=poetic_text, lang='en', slow=False)
         audio_fp = io.BytesIO()
         tts.write_to_fp(audio_fp)
         audio_fp.seek(0)
