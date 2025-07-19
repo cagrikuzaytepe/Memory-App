@@ -11,11 +11,10 @@ from gtts import gTTS
 import requests
 from sqlalchemy.orm import Session
 
-import models, schemas, crud, auth
-from .database import SessionLocal, engine
+import models, schemas, crud, auth, database
 
 # Veritabanı tablolarını oluştur
-models.Base.metadata.create_all(bind=engine)
+models.Base.metadata.create_all(bind=database.engine)
 
 # .env dosyasındaki API anahtarlarını yükle
 load_dotenv()
@@ -31,7 +30,7 @@ app = FastAPI()
 
 # Dependency to get DB session
 def get_db():
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         yield db
     finally:
