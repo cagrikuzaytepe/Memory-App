@@ -12,8 +12,11 @@ import requests
 from sqlalchemy.orm import Session
 
 # Corrected absolute imports using 'main' as the package name
-from main import models, schemas, crud, auth, database
-
+import models
+import schemas
+import crud
+import auth
+import database
 # Create database tables
 models.Base.metadata.create_all(bind=database.engine)
 
