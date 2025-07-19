@@ -1,371 +1,187 @@
-import streamlit as st
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
+import os
+from dotenv import load_dotenv
+import google.generativeai as genai
 from PIL import Image
 import io
-import os
-import requests
 import base64
+from gtts import gTTS
+import requests
+from sqlalchemy.orm import Session
 
-# .env dosyasını yükle (özellikle yerel test için)
-from dotenv import load_dotenv
+# src klasör yapısına göre düzeltilmiş importlar
+from src import models, schemas, crud, auth, database
 
+# Veritabanı tablolarını oluştur
+models.Base.metadata.create_all(bind=database.engine)
+
+# .env dosyasındaki API anahtarlarını yükle
 load_dotenv()
 
-# Backend API URL'i
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+# API anahtarlarını ortam değişkenlerinden al
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 
-# Streamlit sayfa yapılandırması
-st.set_page_config(page_title="Canlı Anılar", page_icon="🖼️", layout="wide")
+# Google Gemini API'sini yapılandır
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# --- KULLANICI YÖNETİMİ VE OTURUM --- #
+app = FastAPI()
 
-if "token" not in st.session_state:
-    st.session_state.token = None
-if "username" not in st.session_state:
-    st.session_state.username = None
-if "credits" not in st.session_state:
-    st.session_state.credits = 0
-
-
-def register_user(username, password):
+# Dependency to get DB session
+def get_db():
+    db = database.SessionLocal()
     try:
-        response = requests.post(
-            f"{BACKEND_URL}/register", json={"username": username, "password": password}
+        yield db
+    finally:
+        db.close()
+
+class ImageRequest(BaseModel):
+    image_bytes_base64: str
+    style_prompt: str
+
+class StoryRequest(BaseModel):
+    image_bytes_base64: str
+
+class SoundRequest(BaseModel):
+    image_bytes_base64: str
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+# User registration
+@app.post("/register", response_model=schemas.User)
+def register_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = crud.get_user_by_username(db, username=user.username)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    return crud.create_user(db=db, user=user)
+
+# User login (OAuth2)
+@app.post("/token", response_model=schemas.Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = auth.get_user(db, username=form_data.username)
+    if not user or not auth.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        response.raise_for_status()
-        st.success("Kayıt başarılı! Lütfen giriş yapın.")
-        return True
-    except requests.exceptions.HTTPError as e:
-        st.error(f"Kayıt hatası: {e.response.json().get('detail', 'Bilinmeyen hata.')}")
-        return False
-    except Exception as e:
-        st.error(f"Beklenmedik bir hata oluştu: {e}")
-        return False
+    access_token = auth.create_access_token(
+        data={"sub": user.username}
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
+# Get current user info
+@app.get("/users/me", response_model=schemas.User)
+async def read_users_me(current_user: schemas.User = Depends(auth.get_current_user)):
+    return current_user
 
-def login_user(username, password):
+# Buy credits (simulated)
+@app.post("/buy_credits")
+async def buy_credits(credits_to_add: int, current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    if credits_to_add <= 0:
+        raise HTTPException(status_code=400, detail="Credit amount must be positive.")
+    updated_user = crud.update_user_credits(db, user_id=current_user.id, credits_to_add=credits_to_add)
+    return {"message": f"{credits_to_add} credits added.", "new_credits": updated_user.credits}
+
+@app.post("/generate_artistic_image")
+async def generate_artistic_image_endpoint(request: ImageRequest, current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    if not STABILITY_API_KEY:
+        raise HTTPException(status_code=500, detail="Image generation feature is not configured by the administrator.")
+
+    if current_user.credits < 1:
+        raise HTTPException(status_code=402, detail="Not enough credits. Please buy more.")
+
     try:
-        response = requests.post(
-            f"{BACKEND_URL}/token", data={"username": username, "password": password}
-        )
+        image_bytes = base64.b64decode(request.image_bytes_base64)
+
+        url = "https://api.stability.ai/v1/generation/stable-diffusion-v1-6/image-to-image"
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {STABILITY_API_KEY}",
+        }
+        files = {"init_image": image_bytes}
+        data = {
+            "image_strength": 0.35,
+            "init_image_mode": "IMAGE_STRENGTH",
+            "text_prompts[0][text]": request.style_prompt,
+            "cfg_scale": 7,
+            "samples": 1,
+            "steps": 30,
+        }
+
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=90)
         response.raise_for_status()
-        token_data = response.json()
-        st.session_state.token = token_data["access_token"]
-        st.session_state.username = username
-        st.success(f"Hoş geldiniz, {username}!")
-        fetch_user_info()
-        return True
-    except requests.exceptions.HTTPError as e:
-        st.error(
-            f"Giriş hatası: {e.response.json().get('detail', 'Kullanıcı adı veya şifre hatalı.')}"
-        )
-        return False
+
+        response_data = response.json()
+        image_base64 = response_data["artifacts"][0]["base64"]
+
+        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        return {"image_base64": image_base64}
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Request timed out. The server took too long to respond.")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Network connection issue: {e}")
     except Exception as e:
-        st.error(f"Beklenmedik bir hata oluştu: {e}")
-        return False
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
+@app.post("/generate_story")
+async def generate_story_endpoint(request: StoryRequest, current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Google API key not found or set up.")
 
-def logout_user():
-    st.session_state.token = None
-    st.session_state.username = None
-    st.session_state.credits = 0
-    st.success("Çıkış yapıldı.")
-    st.rerun()
+    if current_user.credits < 1:
+        raise HTTPException(status_code=402, detail="Not enough credits. Please buy more.")
 
+    try:
+        image_bytes = base64.b64decode(request.image_bytes_base64)
+        image_pil = Image.open(io.BytesIO(image_bytes))
+        prompt = "Look at this old family photo. You are someone living in that memory or a spirit observing it. Write a short, nostalgic, and emotional story. Imagine the feelings of the people in the photo, the atmosphere of the place, the unspoken words. Guess the era (e.g., 70s, 80s) from the clothes, the location, and the quality of the photo, and add this detail to your story. Your story should be sincere and touching."
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([prompt, image_pil])
 
-def fetch_user_info():
-    if st.session_state.token:
-        try:
-            headers = {"Authorization": f"Bearer {st.session_state.token}"}
-            response = requests.get(f"{BACKEND_URL}/users/me", headers=headers)
-            response.raise_for_status()
-            user_info = response.json()
-            st.session_state.credits = user_info["credits"]
-        except requests.exceptions.RequestException as e:
-            st.error(f"Kullanıcı bilgileri çekilirken hata: {e}")
-            logout_user()  # Hata durumunda çıkış yap
+        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        return {"story": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while generating the story: {e}")
 
+@app.post("/generate_soundscape")
+async def generate_soundscape_endpoint(request: SoundRequest, current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Google API key not found or set up.")
 
-def buy_credits_simulated(amount):
-    if st.session_state.token:
-        try:
-            headers = {"Authorization": f"Bearer {st.session_state.token}"}
-            response = requests.post(
-                f"{BACKEND_URL}/buy_credits?credits_to_add={amount}", headers=headers
-            )
-            response.raise_for_status()
-            result = response.json()
-            st.success(result["message"])
-            st.session_state.credits = result["new_credits"]
-        except requests.exceptions.HTTPError as e:
-            st.error(
-                f"Kredi satın alma hatası: {e.response.json().get('detail', 'Bilinmeyen hata.')}"
-            )
-        except Exception as e:
-            st.error(f"Beklenmedik bir hata oluştu: {e}")
-    else:
-        st.warning("Kredi satın almak için giriş yapmalısınız.")
+    if current_user.credits < 1:
+        raise HTTPException(status_code=402, detail="Not enough credits. Please buy more.")
 
+    try:
+        image_bytes = base64.b64decode(request.image_bytes_base64)
 
-# --- ARAYÜZ --- #
+        # Adım 1: Gemini ile şiirsel ve atmosferik bir metin üret
+        image_pil = Image.open(io.BytesIO(image_bytes))
+        sound_prompt = (
+            "Look at this old photo and interpret it with a poet's eye. "
+            "Write a short, poetic text that combines the atmosphere of the moment, "
+            "the emotion, and the conceivable sounds. "
+            "Example: 'Whispers of the past are heard... the creak of the wooden floor, a distant laugh "
+            "and heartbeats mingling with the silence in the room...' Only create this literary text."
+        )
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        poetic_text_response = model.generate_content([sound_prompt, image_pil])
+        poetic_text = poetic_text_response.text.strip()
 
-# Kenar çubuğu (Sidebar)
-with st.sidebar:
-    st.image("https://i.imgur.com/G5l4KxS.png", width=100)  # Basit bir logo
-    st.title("Canlı Anılar")
-    st.markdown("---")
+        # Adım 2: gTTS ile metni sese dönüştür
+        tts = gTTS(text=poetic_text, lang='tr', slow=False)
+        audio_fp = io.BytesIO()
+        tts.write_to_fp(audio_fp)
+        audio_fp.seek(0)
+        audio_bytes_base64 = base64.b64encode(audio_fp.read()).decode("utf-8")
 
-    if st.session_state.token:
-        st.write(f"Hoş geldiniz, **{st.session_state.username}**")
-        st.metric(label="Kalan Kredi Hakkınız", value=f"{st.session_state.credits} 💖")
-        if st.button("Çıkış Yap"):
-            logout_user()
-        st.markdown("---")
-        st.subheader("Kredi Satın Al")
-        if st.button("10 Kredi Satın Al ($5)"):  # Simüle edilmiş
-            buy_credits_simulated(10)
-    else:
-        st.subheader("Giriş Yap / Kayıt Ol")
-        login_tab, register_tab = st.tabs(["Giriş Yap", "Kayıt Ol"])
-        with login_tab:
-            login_username = st.text_input("Kullanıcı Adı", key="login_username")
-            login_password = st.text_input(
-                "Şifre", type="password", key="login_password"
-            )
-            if st.button("Giriş Yap", key="do_login_btn"):
-                login_user(login_username, login_password)
-        with register_tab:
-            register_username = st.text_input("Kullanıcı Adı", key="register_username")
-            register_password = st.text_input(
-                "Şifre", type="password", key="register_password"
-            )
-            if st.button("Kayıt Ol", key="do_register_btn"):
-                register_user(register_username, register_password)
+        crud.update_user_credits(db, user_id=current_user.id, credits_to_add=-1)
+        return {"audio_base64": audio_bytes_base64}
 
-    st.markdown("---")
-    st.info(
-        "Bu proje, eski fotoğraflarınıza yapay zeka ile yeni bir hayat vermek için tasarlanmıştır. "
-        "Her bir 'üretim' işlemi (tablo, hikaye, ses) 1 kredi kullanır."
-    )
-
-
-st.title("🖼️ Canlı Anılar: Anılarınızı Sanata Dönüştürün")
-st.markdown(
-    "Tozlu albümlerde unutulmuş değerli bir aile fotoğrafınızı yükleyin ve yapay zekanın sihrini izleyin."
-)
-
-# Kullanıcı giriş yapmamışsa ana içeriği gösterme
-if not st.session_state.token:
-    st.info("Devam etmek için lütfen giriş yapın veya kayıt olun.")
-else:
-    # Dosya yükleme alanı
-    uploaded_file = st.file_uploader(
-        "Lütfen .jpg, .jpeg veya .png formatında bir fotoğraf yükleyin",
-        type=["jpg", "jpeg", "png"],
-    )
-
-    if uploaded_file is not None:
-        # Yüklenen dosyayı byte olarak oku ve base64'e çevir
-        image_bytes = uploaded_file.getvalue()
-        image_bytes_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        st.markdown("---")
-        st.subheader("Yüklenen Anı")
-        st.image(image_bytes, width=400, caption="Orijinal Fotoğraf")
-
-        st.markdown("---")
-        st.subheader("✨ Yapay Zeka ile Anınızı Canlandırın")
-
-        col1, col2, col3 = st.columns(3, gap="large")
-
-        # --- SÜTUN 1: Sanatsal Tablo (Premium Özellik) ---
-        with col1:
-            st.markdown("#### 1. Sanatsal Tabloya Dönüştür")
-            style = st.selectbox(
-                "Hangi stilde bir tablo istersiniz?",
-                (
-                    "Sulu Boya (Watercolor painting)",
-                    "Yağlı Boya (Oil painting)",
-                    "Çizgi Roman (Comic book art)",
-                    "Dijital Sanat (Digital art)",
-                    "Piksel Sanat (Pixel art)",
-                ),
-                key="style_select",
-            )
-
-            if st.button("🎨 Tablo Oluştur", key="btn_art"):
-                if st.session_state.credits < 1:
-                    st.warning("Yeterli krediniz yok. Lütfen kredi satın alın.")
-                else:
-                    with st.spinner(
-                        "Sanatçımız fırçasını hazırlıyor... Lütfen bekleyin."
-                    ):
-                        try:
-                            style_prompt = style.split("(")[1][
-                                :-1
-                            ]  # Parantez içindeki ingilizce metni al
-
-                            headers = {
-                                "Authorization": f"Bearer {st.session_state.token}"
-                            }
-                            response = requests.post(
-                                f"{BACKEND_URL}/generate_artistic_image",
-                                headers=headers,
-                                json={
-                                    "image_bytes_base64": image_bytes_base64,
-                                    "style_prompt": style_prompt,
-                                },
-                            )
-                            response.raise_for_status()  # HTTP hatalarını yakala (4xx, 5xx)
-                            result = response.json()
-
-                            if "image_base64" in result:
-                                artistic_image_bytes = base64.b64decode(
-                                    result["image_base64"]
-                                )
-                                st.image(
-                                    artistic_image_bytes,
-                                    caption=f"Yapay Zeka Yorumu: {style.split('(')[0]}",
-                                )
-                                fetch_user_info()  # Kredi güncellemeyi çek
-                            else:
-                                st.error(
-                                    "Tablo oluşturulamadı. Beklenmedik bir yanıt alındı."
-                                )
-                        except (
-                            requests.exceptions.HTTPError
-                        ) as e:  # HTTP 4xx/5xx hataları
-                            st.error(f"API isteği hatası: {e}")
-                            if e.response is not None:  # Yanıt objesi varsa
-                                try:
-                                    error_detail = e.response.json().get(
-                                        "detail", "Bilinmeyen hata."
-                                    )
-                                    st.error(f"Detay: {error_detail}")
-                                except requests.exceptions.JSONDecodeError:
-                                    st.error(f"Detay: {e.response.text}")
-                            else:
-                                st.error("Sunucudan yanıt alınamadı.")
-                        except (
-                            requests.exceptions.ConnectionError
-                        ) as e:  # Bağlantı hataları
-                            st.error(
-                                f"Bağlantı hatası: Backend sunucusuna ulaşılamadı. Lütfen backend'in çalıştığından emin olun. Detay: {e}"
-                            )
-                        except requests.exceptions.Timeout as e:  # Zaman aşımı hataları
-                            st.error(
-                                f"Zaman aşımı hatası: Backend sunucusu çok yavaş yanıt veriyor. Detay: {e}"
-                            )
-                        except (
-                            requests.exceptions.RequestException
-                        ) as e:  # Diğer istek hataları
-                            st.error(f"Genel API isteği hatası: {e}")
-                        except Exception as e:  # Beklenmedik diğer hatalar
-                            st.error(f"Beklenmedik bir hata oluştu: {e}")
-
-        # --- SÜTUN 2: Kısa Hikaye ---
-        with col2:
-            st.markdown("#### 2. O Anın Hikayesini Yazdır")
-            if st.button("✒️ Hikaye Yaz", key="btn_story"):
-                if st.session_state.credits < 1:
-                    st.warning("Yeterli krediniz yok. Lütfen kredi satın alın.")
-                else:
-                    with st.spinner("Yazarımız ilham perilerini çağırıyor..."):
-                        try:
-                            headers = {
-                                "Authorization": f"Bearer {st.session_state.token}"
-                            }
-                            response = requests.post(
-                                f"{BACKEND_URL}/generate_story",
-                                headers=headers,
-                                json={"image_bytes_base64": image_bytes_base64},
-                            )
-                            response.raise_for_status()
-                            result = response.json()
-                            if "story" in result:
-                                st.markdown(result["story"])
-                                fetch_user_info()  # Kredi güncellemeyi çek
-                            else:
-                                st.error(
-                                    "Hikaye oluşturulamadı. Beklenmedik bir yanıt alındı."
-                                )
-                        except requests.exceptions.HTTPError as e:
-                            st.error(f"API isteği hatası: {e}")
-                            if e.response is not None:
-                                try:
-                                    error_detail = e.response.json().get(
-                                        "detail", "Bilinmeyen hata."
-                                    )
-                                    st.error(f"Detay: {error_detail}")
-                                except requests.exceptions.JSONDecodeError:
-                                    st.error(f"Detay: {e.response.text}")
-                            else:
-                                st.error("Sunucudan yanıt alınamadı.")
-                        except requests.exceptions.ConnectionError as e:
-                            st.error(
-                                f"Bağlantı hatası: Backend sunucusuna ulaşılamadı. Lütfen backend'in çalıştığından emin olun. Detay: {e}"
-                            )
-                        except requests.exceptions.Timeout as e:
-                            st.error(
-                                f"Zaman aşımı hatası: Backend sunucusu çok yavaş yanıt veriyor. Detay: {e}"
-                            )
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"Genel API isteği hatası: {e}")
-                        except Exception as e:
-                            st.error(f"Beklenmedik bir hata oluştu: {e}")
-
-        # --- SÜTUN 3: Ses Manzarası ---
-        with col3:
-            st.markdown("#### 3. O Anın Sesini Hayal Et")
-            if st.button("🔊 Ses Manzarası Oluştur", key="btn_sound"):
-                if st.session_state.credits < 1:
-                    st.warning("Yeterli krediniz yok. Lütfen kredi satın alın.")
-                else:
-                    with st.spinner(
-                        "Ses mühendisimiz geçmişe kulak veriyor... Bu işlem 1-2 dakika sürebilir."
-                    ):
-                        try:
-                            headers = {
-                                "Authorization": f"Bearer {st.session_state.token}"
-                            }
-                            response = requests.post(
-                                f"{BACKEND_URL}/generate_soundscape",
-                                headers=headers,
-                                json={"image_bytes_base64": image_bytes_base64},
-                            )
-                            response.raise_for_status()
-                            result = response.json()
-                            if "audio_base64" in result:
-                                audio_data = base64.b64decode(result["audio_base64"])
-                                st.audio(
-                                    audio_data, format="audio/mpeg"
-                                )  # gTTS mp3 döndürüyor
-                                st.info("İpucu: En iyi deneyim için kulaklık kullanın.")
-                                fetch_user_info()  # Kredi güncellemeyi çek
-                            else:
-                                st.error(
-                                    "Ses manzarası oluşturulamadı. Beklenmedik bir yanıt alındı."
-                                )
-                        except requests.exceptions.HTTPError as e:
-                            st.error(f"API isteği hatası: {e}")
-                            if e.response is not None:
-                                try:
-                                    error_detail = e.response.json().get(
-                                        "detail", "Bilinmeyen hata."
-                                    )
-                                    st.error(f"Detay: {error_detail}")
-                                except requests.exceptions.JSONDecodeError:
-                                    st.error(f"Detay: {e.response.text}")
-                            else:
-                                st.error("Sunucudan yanıt alınamadı.")
-                        except requests.exceptions.ConnectionError as e:
-                            st.error(
-                                f"Bağlantı hatası: Backend sunucusuna ulaşılamadı. Lütfen backend'in çalıştığından emin olun. Detay: {e}"
-                            )
-                        except requests.exceptions.Timeout as e:
-                            st.error(
-                                f"Zaman aşımı hatası: Backend sunucusu çok yavaş yanıt veriyor. Detay: {e}"
-                            )
-                        except requests.exceptions.RequestException as e:
-                            st.error(f"Genel API isteği hatası: {e}")
-                        except Exception as e:
-                            st.error(f"Beklenmedik bir hata oluştu: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while creating the soundscape: {e}")
