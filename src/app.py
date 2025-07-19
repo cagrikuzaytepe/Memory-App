@@ -84,7 +84,7 @@ async def read_users_me(current_user: schemas.User = Depends(auth.get_current_us
 async def buy_credits(credits_to_add: int, current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
     if credits_to_add <= 0:
         raise HTTPException(status_code=400, detail="Credit amount must be positive.")
-    updated_user = crud.update_user_credits(db, user_id=current_user.id, credits_to_add=credits_to_add)
+    updated_user = crud.update_user_credits(db, user_id=current_user.id, amount=-1)
     return {"message": f"{credits_to_add} credits added.", "new_credits": updated_user.credits}
 
 @app.post("/generate_artistic_image")
