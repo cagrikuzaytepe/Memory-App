@@ -11,7 +11,7 @@ from gtts import gTTS
 import requests
 from sqlalchemy.orm import Session
 
-from app  import models, schemas, crud, auth
+import models, schemas, crud, auth
 from .database import SessionLocal, engine
 
 # Veritabanı tablolarını oluştur
